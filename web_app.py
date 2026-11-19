@@ -1,5 +1,8 @@
 import os
 import sys
+import gc
+import time
+import uuid
 import json
 import math
 import zipfile
@@ -22,6 +25,9 @@ app.add_middleware(
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TEMPLATE_JSON_PATH = os.path.join(BASE_DIR, "bambu_base_template.json")
+ICON_PATH = os.path.join(BASE_DIR, "app_icon.ico")
+UPLOAD_TMP_DIR = os.path.join(tempfile.gettempdir(), "blogo_bambu_uploads")
+os.makedirs(UPLOAD_TMP_DIR, exist_ok=True)
 
 # Environment-driven Authentication (Defaults provided for quick start)
 AUTH_USER = os.getenv("APP_AUTH_USER", "blogo")
@@ -294,13 +300,36 @@ def logout(response: Response):
     response.delete_cookie(key="blogo_token")
     return {"success": True, "message": "Logged out successfully."}
 
+@app.get("/favicon.ico", include_in_schema=False)
+def favicon():
+    if os.path.exists(ICON_PATH):
+        return FileResponse(ICON_PATH, media_type="image/x-icon")
+    return Response(status_code=204)
+
 @app.get("/api/auth-check")
-def auth_check(user: str = Depends(get_current_user)):
-    return {"authenticated": True, "username": user}
+def auth_check(request: Request):
+    token = request.cookies.get("blogo_token") or request.headers.get("X-Blogo-Auth")
+    if not token:
+        auth_header = request.headers.get("Authorization")
+        if auth_header and auth_header.startswith("Bearer "):
+            token = auth_header.split(" ")[1]
+    if token == AUTH_TOKEN:
+        return {"authenticated": True, "username": AUTH_USER}
+    return {"authenticated": False, "username": None}
 
 @app.get("/api/health")
 def health():
     return {"status": "ok", "app": "Bambu A1 Cloud Optimizer", "auth_enabled": True}
+
+def cleanup_stale_uploads(max_age_seconds: int = 1800):
+    now = time.time()
+    try:
+        for name in os.listdir(UPLOAD_TMP_DIR):
+            fpath = os.path.join(UPLOAD_TMP_DIR, name)
+            if os.path.isfile(fpath) and (now - os.path.getmtime(fpath)) > max_age_seconds:
+                os.remove(fpath)
+    except Exception:
+        pass
 
 # ================= PROTECTED CORE ENDPOINTS =================
 @app.post("/api/analyze")
@@ -308,14 +337,16 @@ async def analyze_model(
     file: UploadFile = File(...),
     user: str = Depends(get_current_user)
 ):
+    cleanup_stale_uploads()
     suffix = os.path.splitext(file.filename)[1].lower()
     if suffix not in ['.stl', '.3mf', '.obj']:
         raise HTTPException(status_code=400, detail="Only STL, 3MF, and OBJ files are supported.")
         
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+    tmp_path = os.path.join(UPLOAD_TMP_DIR, f"{uuid.uuid4().hex}{suffix}")
+    with open(tmp_path, "wb") as tmp:
         content = await file.read()
         tmp.write(content)
-        tmp_path = tmp.name
+        del content
         
     try:
         mesh = load_mesh_safe(tmp_path)
@@ -328,6 +359,8 @@ async def analyze_model(
             
         est_weight = vol * 1.24 * 0.45
         est_cost = est_weight * 1.20
+        del mesh
+        gc.collect()
         
         return {
             "success": True,
@@ -343,6 +376,7 @@ async def analyze_model(
     except Exception as e:
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
+        gc.collect()
         raise HTTPException(status_code=500, detail=str(e))
 
 def cleanup_temp_files(*paths):
@@ -368,17 +402,20 @@ async def optimize_model(
     base_name = os.path.splitext(original_name)[0]
     scale_str = f"_{int(scale*100)}pct" if abs(scale - 1.0) > 1e-4 else ""
     out_filename = f"{base_name}{scale_str}_BambuA1_Optimized.3mf"
-    out_path = os.path.join(tempfile.gettempdir(), out_filename)
+    out_path = os.path.join(UPLOAD_TMP_DIR, f"out_{uuid.uuid4().hex}.3mf")
     
     try:
         generate_optimized_3mf(tmp_path, out_path, mode=mode, scale_factor=scale)
-        background_tasks.add_task(cleanup_temp_files, tmp_path, out_path)
+        gc.collect()
+        background_tasks.add_task(cleanup_temp_files, out_path)
         return FileResponse(
             out_path,
             filename=out_filename,
             media_type="application/vnd.ms-package.3dmanufacturing-3dmodel+xml"
         )
     except Exception as e:
+        cleanup_temp_files(out_path)
+        gc.collect()
         raise HTTPException(status_code=500, detail=f"Optimization failed: {str(e)}")
 
 # ================= MODERN SAAS UI WITH LOGIN =================
@@ -638,10 +675,12 @@ def index():
         const res = await fetch('/api/auth-check');
         if (res.ok) {
           const data = await res.json();
-          showApp(data.username || 'blogo');
-        } else {
-          showLogin();
+          if (data.authenticated) {
+            showApp(data.username || 'blogo');
+            return;
+          }
         }
+        showLogin();
       } catch (e) {
         showLogin();
       }

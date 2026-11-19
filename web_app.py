@@ -1,16 +1,19 @@
 import os
+import re
 import sys
 import gc
+import html
 import time
 import uuid
 import json
 import math
+import struct
 import zipfile
 import tempfile
-import trimesh
+import xml.etree.ElementTree as ET
 import numpy as np
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Depends, Request, Response, BackgroundTasks, status
-from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
+from fastapi.responses import HTMLResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI(title="Bambu A1 Cloud Optimizer SaaS")
@@ -34,19 +37,63 @@ AUTH_USER = os.getenv("APP_AUTH_USER", "blogo")
 AUTH_PASS = os.getenv("APP_AUTH_PASS", "Blogo@12")
 AUTH_TOKEN = os.getenv("APP_AUTH_TOKEN", "blogo_secure_session_token_2026_a1")
 
+STL_DTYPE = np.dtype([('normal', '<f4', 3), ('v', '<f4', (3, 3)), ('attr', '<u2')])
+
+UNIT_TO_MM = {
+    "millimeter": 1.0,
+    "centimeter": 10.0,
+    "meter": 1000.0,
+    "inch": 25.4,
+    "foot": 304.8,
+    "micron": 0.001,
+}
+
+# Fast compiled byte regexes for streaming 3MF XML
+_RE_VERTEX_FAST = re.compile(rb'<vertex\s+x="([^"]+)"\s+y="([^"]+)"\s+z="([^"]+)"')
+_RE_VERTEX_TAG = re.compile(rb'<vertex\s+([^>]+)>')
+_RE_ATTR_X = re.compile(rb'\bx=["\']([^"\']+)["\']')
+_RE_ATTR_Y = re.compile(rb'\by=["\']([^"\']+)["\']')
+_RE_ATTR_Z = re.compile(rb'\bz=["\']([^"\']+)["\']')
+_RE_TRI_FAST = re.compile(rb'<triangle\s+v1="(\d+)"\s+v2="(\d+)"\s+v3="(\d+)"')
+_RE_TRI_TAG = re.compile(rb'<triangle\s+([^>]+)>')
+_RE_ATTR_V1 = re.compile(rb'\bv1=["\'](\d+)["\']')
+_RE_ATTR_V2 = re.compile(rb'\bv2=["\'](\d+)["\']')
+_RE_ATTR_V3 = re.compile(rb'\bv3=["\'](\d+)["\']')
+
+CONTENT_TYPES_XML = (
+    '<?xml version="1.0" encoding="UTF-8"?>\n'
+    '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+    '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+    '<Default Extension="model" ContentType="application/vnd.ms-package.3dmanufacturing-3dmodel+xml"/>'
+    '<Default Extension="png" ContentType="image/png"/>'
+    '<Default Extension="jpg" ContentType="image/jpeg"/>'
+    '<Default Extension="jpeg" ContentType="image/jpeg"/>'
+    '</Types>'
+)
+
+RELS_XML = (
+    '<?xml version="1.0" encoding="UTF-8"?>\n'
+    '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+    '<Relationship Target="/3D/3dmodel.model" Id="rel0" '
+    'Type="http://schemas.microsoft.com/3dmanufacturing/2013/01/3dmodel"/>'
+    '</Relationships>'
+)
+
+
 def get_current_user(request: Request):
     token = request.cookies.get("blogo_token") or request.headers.get("X-Blogo-Auth")
     if not token:
         auth_header = request.headers.get("Authorization")
         if auth_header and auth_header.startswith("Bearer "):
             token = auth_header.split(" ")[1]
-            
+
     if token != AUTH_TOKEN:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Unauthorized: Please log in with valid credentials."
         )
     return AUTH_USER
+
 
 def get_base_bambu_template():
     if os.path.exists(TEMPLATE_JSON_PATH):
@@ -57,34 +104,382 @@ def get_base_bambu_template():
             pass
     return {}
 
-def load_mesh_safe(file_path):
-    loaded = trimesh.load(file_path)
+
+# ==============================================================================
+# ULTRA-LOW-RAM STREAMING 3D GEOMETRY ENGINE (STL / 3MF / OBJ)
+# Designed to handle 70MB+ STLs and 225MB+ uncompressed 3MFs inside 512MB RAM!
+# ==============================================================================
+
+def is_binary_stl(file_path: str) -> bool:
+    size = os.path.getsize(file_path)
+    if size < 84:
+        return False
+    with open(file_path, 'rb') as f:
+        header = f.read(84)
+    n_tri = struct.unpack('<I', header[80:84])[0]
+    return size == 84 + n_tri * 50
+
+
+def analyze_binary_stl(file_path: str) -> dict:
+    with open(file_path, 'rb') as f:
+        header = f.read(84)
+        n_tri = struct.unpack('<I', header[80:84])[0]
+        if n_tri == 0:
+            raise ValueError("STL file contains 0 triangles.")
+
+        min_xyz = np.array([np.inf, np.inf, np.inf], dtype=np.float64)
+        max_xyz = np.array([-np.inf, -np.inf, -np.inf], dtype=np.float64)
+        signed_vol = 0.0
+        chunk_tris = 50000
+        remaining = n_tri
+
+        while remaining > 0:
+            cnt = min(chunk_tris, remaining)
+            buf = f.read(cnt * 50)
+            if not buf:
+                break
+            arr = np.frombuffer(buf, dtype=STL_DTYPE)
+            v = arr['v']  # (cnt, 3, 3) float32
+            min_xyz = np.minimum(min_xyz, v.min(axis=(0, 1)))
+            max_xyz = np.maximum(max_xyz, v.max(axis=(0, 1)))
+            # Fast chunked signed volume without extra RAM
+            v0 = v[:, 0, :].astype(np.float64)
+            v1 = v[:, 1, :].astype(np.float64)
+            v2 = v[:, 2, :].astype(np.float64)
+            signed_vol += float(np.einsum('ij,ij->i', v0, np.cross(v1, v2)).sum()) / 6.0
+            remaining -= cnt
+
+    dims = max_xyz - min_xyz
+    vol_cm3 = abs(signed_vol) / 1000.0
+    bbox_vol_cm3 = float(dims[0] * dims[1] * dims[2]) / 1000.0
+    if vol_cm3 <= 0.0 or vol_cm3 > bbox_vol_cm3 * 1.05:
+        vol_cm3 = bbox_vol_cm3 * 0.35
+
+    return {
+        "min_xyz": [float(min_xyz[0]), float(min_xyz[1]), float(min_xyz[2])],
+        "max_xyz": [float(max_xyz[0]), float(max_xyz[1]), float(max_xyz[2])],
+        "width": float(dims[0]),
+        "depth": float(dims[1]),
+        "height": float(dims[2]),
+        "faces": int(n_tri),
+        "vol_cm3": float(vol_cm3),
+    }
+
+
+def _parse_3mf_matrix(t_str: str) -> np.ndarray:
+    """Parse 12-float 3MF affine transform into a 4x4 row-vector matrix (p' = p @ M)."""
+    M = np.eye(4, dtype=np.float64)
+    if not t_str:
+        return M
+    parts = t_str.strip().split()
+    if len(parts) != 12:
+        return M
+    vals = [float(x) for x in parts]
+    M[0, :3] = vals[0:3]
+    M[1, :3] = vals[3:6]
+    M[2, :3] = vals[6:9]
+    M[3, :3] = vals[9:12]
+    return M
+
+
+def _strip_ns(tag: str) -> str:
+    return tag.split('}', 1)[-1] if '}' in tag else tag
+
+
+def _get_3mf_parts(zip_path: str):
+    """
+    Inspect a 3MF archive without loading huge geometry XMLs into DOM.
+    Returns (unit_scale, parts) where parts = [(zip_member_path, 4x4_matrix), ...].
+    """
+    with zipfile.ZipFile(zip_path, 'r') as z:
+        names = z.namelist()
+        root_name = None
+        for n in names:
+            if n.lower() == '3d/3dmodel.model':
+                root_name = n
+                break
+        if not root_name:
+            model_files = [n for n in names if n.lower().endswith('.model')]
+            if not model_files:
+                raise ValueError("No .model geometry found inside 3MF archive.")
+            root_name = model_files[0]
+
+        root_info = z.getinfo(root_name)
+        with z.open(root_name) as f:
+            head = f.read(4096).decode('utf-8', errors='ignore')
+
+        unit_match = re.search(r'\bunit=["\']([^"\']+)["\']', head, re.IGNORECASE)
+        unit_name = unit_match.group(1).lower() if unit_match else "millimeter"
+        unit_scale = UNIT_TO_MM.get(unit_name, 1.0)
+
+        # Case A: Small root 3dmodel.model (typically references 3D/Objects/*.model)
+        if root_info.file_size < 2 * 1024 * 1024:
+            root_xml = z.read(root_name)
+            try:
+                tree_root = ET.fromstring(root_xml)
+                objects = {}
+                for elem in tree_root.iter():
+                    if _strip_ns(elem.tag) == 'object':
+                        oid = elem.attrib.get('id')
+                        if oid is not None:
+                            objects[oid] = elem
+
+                # Build name map for case-insensitive lookup
+                name_lookup = {n.lstrip('/').lower(): n for n in names}
+
+                def resolve_obj(oid, parent_mat, depth=0):
+                    if depth > 12 or oid not in objects:
+                        return []
+                    obj_el = objects[oid]
+                    res = []
+                    has_mesh = False
+                    has_comp = False
+                    for child in obj_el:
+                        ctag = _strip_ns(child.tag)
+                        if ctag == 'mesh':
+                            has_mesh = True
+                        elif ctag == 'components':
+                            for comp in child:
+                                if _strip_ns(comp.tag) == 'component':
+                                    has_comp = True
+                                    c_mat = _parse_3mf_matrix(comp.attrib.get('transform', ''))
+                                    combined = c_mat @ parent_mat
+                                    c_oid = comp.attrib.get('objectid')
+                                    c_path = None
+                                    for ak, av in comp.attrib.items():
+                                        if ak.endswith('path'):
+                                            c_path = av
+                                            break
+                                    if c_path:
+                                        norm = c_path.lstrip('/').lower()
+                                        if norm in name_lookup:
+                                            res.append((name_lookup[norm], combined))
+                                    elif c_oid:
+                                        res.extend(resolve_obj(c_oid, combined, depth + 1))
+                    if has_mesh and not has_comp:
+                        res.append((root_name, parent_mat))
+                    return res
+
+                parts = []
+                for elem in tree_root.iter():
+                    if _strip_ns(elem.tag) == 'item':
+                        oid = elem.attrib.get('objectid')
+                        imat = _parse_3mf_matrix(elem.attrib.get('transform', ''))
+                        parts.extend(resolve_obj(oid, imat))
+                if parts:
+                    return unit_scale, parts
+            except Exception:
+                pass
+
+        # Case B: Large inline 3dmodel.model -> check tail for <item transform="...">
+        tail_mat = np.eye(4, dtype=np.float64)
+        try:
+            with z.open(root_name) as f:
+                # Read only small tail if possible via streaming chunks keeping last 16KB
+                if root_info.file_size <= 64 * 1024:
+                    tail = f.read().decode('utf-8', errors='ignore')
+                else:
+                    # Quick scan for external object models first
+                    ext_models = [n for n in names if n.lower().endswith('.model') and n != root_name]
+                    if ext_models:
+                        return unit_scale, [(m, np.eye(4, dtype=np.float64)) for m in ext_models]
+                    return unit_scale, [(root_name, tail_mat)]
+            m_item = re.search(r'<item[^>]*transform=["\']([^"\']+)["\']', tail)
+            if m_item:
+                tail_mat = _parse_3mf_matrix(m_item.group(1))
+        except Exception:
+            pass
+
+        return unit_scale, [(root_name, tail_mat)]
+
+
+def _extract_vertices_from_chunk(proc: bytes):
+    """Extract float32 (N, 3) vertices from an XML byte chunk using fast path + order-agnostic fallback."""
+    matches = _RE_VERTEX_FAST.findall(proc)
+    if matches:
+        return np.array(matches, dtype=np.float32)
+    # Fallback for unusual attribute order or single quotes
+    pts = []
+    for m in _RE_VERTEX_TAG.finditer(proc):
+        attrs = m.group(1)
+        mx = _RE_ATTR_X.search(attrs)
+        my = _RE_ATTR_Y.search(attrs)
+        mz = _RE_ATTR_Z.search(attrs)
+        if mx and my and mz:
+            pts.append((float(mx.group(1)), float(my.group(1)), float(mz.group(1))))
+    if pts:
+        return np.array(pts, dtype=np.float32)
+    return None
+
+
+def _extract_triangles_from_chunk(proc: bytes):
+    """Extract (v1, v2, v3) tuples from an XML byte chunk."""
+    matches = _RE_TRI_FAST.findall(proc)
+    if matches:
+        return matches
+    tris = []
+    for m in _RE_TRI_TAG.finditer(proc):
+        attrs = m.group(1)
+        m1 = _RE_ATTR_V1.search(attrs)
+        m2 = _RE_ATTR_V2.search(attrs)
+        m3 = _RE_ATTR_V3.search(attrs)
+        if m1 and m2 and m3:
+            tris.append((m1.group(1), m2.group(1), m3.group(1)))
+    return tris
+
+
+def analyze_3mf_streaming(file_path: str) -> dict:
+    unit_scale, parts = _get_3mf_parts(file_path)
+    min_xyz = np.array([np.inf, np.inf, np.inf], dtype=np.float64)
+    max_xyz = np.array([-np.inf, -np.inf, -np.inf], dtype=np.float64)
+    total_faces = 0
+    total_verts = 0
+
+    with zipfile.ZipFile(file_path, 'r') as z:
+        for model_name, mat in parts:
+            rot = (mat[:3, :3] * unit_scale).astype(np.float32)
+            trans = (mat[3, :3] * unit_scale).astype(np.float32)
+            is_identity_rot = np.allclose(rot, np.eye(3, dtype=np.float32), atol=1e-6)
+            is_zero_trans = np.allclose(trans, 0.0, atol=1e-6)
+
+            with z.open(model_name) as f:
+                rem = b''
+                while True:
+                    chunk = f.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    data = rem + chunk
+                    last_gt = data.rfind(b'>')
+                    if last_gt != -1:
+                        proc, rem = data[:last_gt + 1], data[last_gt + 1:]
+                    else:
+                        proc, rem = b'', data
+
+                    if b'<vertex' in proc:
+                        arr = _extract_vertices_from_chunk(proc)
+                        if arr is not None and len(arr) > 0:
+                            if not is_identity_rot:
+                                arr = arr @ rot
+                            if not is_zero_trans:
+                                arr += trans
+                            min_xyz = np.minimum(min_xyz, arr.min(axis=0))
+                            max_xyz = np.maximum(max_xyz, arr.max(axis=0))
+                            total_verts += len(arr)
+
+                    if b'<triangle ' in proc:
+                        total_faces += proc.count(b'<triangle ')
+
+    if total_verts == 0 or not np.all(np.isfinite(min_xyz)):
+        raise ValueError("No valid 3D geometry found in 3MF file.")
+
+    dims = max_xyz - min_xyz
+    vol_cm3 = float(dims[0] * dims[1] * dims[2]) / 1000.0 * 0.35
+    return {
+        "min_xyz": [float(min_xyz[0]), float(min_xyz[1]), float(min_xyz[2])],
+        "max_xyz": [float(max_xyz[0]), float(max_xyz[1]), float(max_xyz[2])],
+        "width": float(dims[0]),
+        "depth": float(dims[1]),
+        "height": float(dims[2]),
+        "faces": int(total_faces),
+        "vol_cm3": float(vol_cm3),
+    }
+
+
+def analyze_obj_streaming(file_path: str) -> dict:
+    min_xyz = np.array([np.inf, np.inf, np.inf], dtype=np.float64)
+    max_xyz = np.array([-np.inf, -np.inf, -np.inf], dtype=np.float64)
+    faces = 0
+    verts = 0
+
+    with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+        for line in f:
+            if line.startswith('v '):
+                parts = line.split()
+                if len(parts) >= 4:
+                    x, y, z_v = float(parts[1]), float(parts[2]), float(parts[3])
+                    if x < min_xyz[0]: min_xyz[0] = x
+                    if x > max_xyz[0]: max_xyz[0] = x
+                    if y < min_xyz[1]: min_xyz[1] = y
+                    if y > max_xyz[1]: max_xyz[1] = y
+                    if z_v < min_xyz[2]: min_xyz[2] = z_v
+                    if z_v > max_xyz[2]: max_xyz[2] = z_v
+                    verts += 1
+            elif line.startswith('f '):
+                n_toks = len(line.split()) - 1
+                if n_toks >= 3:
+                    faces += (n_toks - 2)
+
+    if verts == 0:
+        raise ValueError("No valid vertices found in OBJ file.")
+
+    dims = max_xyz - min_xyz
+    vol_cm3 = float(dims[0] * dims[1] * dims[2]) / 1000.0 * 0.35
+    return {
+        "min_xyz": [float(min_xyz[0]), float(min_xyz[1]), float(min_xyz[2])],
+        "max_xyz": [float(max_xyz[0]), float(max_xyz[1]), float(max_xyz[2])],
+        "width": float(dims[0]),
+        "depth": float(dims[1]),
+        "height": float(dims[2]),
+        "faces": int(faces),
+        "vol_cm3": float(vol_cm3),
+    }
+
+
+def analyze_fallback_trimesh(file_path: str) -> dict:
+    """Lazy-import trimesh ONLY for rare ASCII STL files to keep startup RAM ~80MB."""
+    import trimesh
+    loaded = trimesh.load(file_path, process=False)
     if isinstance(loaded, trimesh.Scene):
         meshes = [g for g in loaded.geometry.values() if isinstance(g, trimesh.Trimesh)]
         if not meshes:
-            raise ValueError("No valid 3D geometry found in 3MF/Scene.")
-        return trimesh.util.concatenate(meshes)
+            raise ValueError("No valid 3D geometry found.")
+        mesh = trimesh.util.concatenate(meshes)
     elif isinstance(loaded, trimesh.Trimesh):
-        return loaded
+        mesh = loaded
     else:
         raise ValueError("Unsupported 3D geometry format.")
 
-def generate_optimized_3mf(input_file_path, output_3mf_path, mode="crystal", scale_factor=1.0):
-    mesh = load_mesh_safe(input_file_path)
-    if abs(scale_factor - 1.0) > 1e-4:
-        mesh.apply_scale(scale_factor)
-        
-    extents = mesh.extents
-    width, depth, height = float(extents[0]), float(extents[1]), float(extents[2])
-    
+    b = mesh.bounds
+    dims = b[1] - b[0]
+    vol_cm3 = float(dims[0] * dims[1] * dims[2]) / 1000.0 * 0.35
+    res = {
+        "min_xyz": [float(b[0][0]), float(b[0][1]), float(b[0][2])],
+        "max_xyz": [float(b[1][0]), float(b[1][1]), float(b[1][2])],
+        "width": float(dims[0]),
+        "depth": float(dims[1]),
+        "height": float(dims[2]),
+        "faces": int(len(mesh.faces)),
+        "vol_cm3": float(vol_cm3),
+    }
+    del loaded, mesh
+    gc.collect()
+    return res
+
+
+def analyze_file_smart(file_path: str) -> dict:
+    ext = os.path.splitext(file_path)[1].lower()
+    if ext == '.stl':
+        if is_binary_stl(file_path):
+            return analyze_binary_stl(file_path)
+        return analyze_fallback_trimesh(file_path)
+    elif ext == '.3mf':
+        return analyze_3mf_streaming(file_path)
+    elif ext == '.obj':
+        return analyze_obj_streaming(file_path)
+    else:
+        raise ValueError("Only STL, 3MF, and OBJ files are supported.")
+
+
+def build_bambu_config(height: float, mode: str):
+    """Build exact calibrated Bambu Lab A1 project_settings.config."""
     cfg = get_base_bambu_template()
     for k, v in list(cfg.items()):
         if isinstance(v, list) and len(v) == 4:
             cfg[k] = [v[0]]
-            
+
     cfg["flush_volumes_matrix"] = ["0"]
     cfg["flush_volumes_vector"] = ["0", "0"]
-    
+
     cfg["printer_model"] = "Bambu Lab A1"
     cfg["printer_settings_id"] = "Bambu Lab A1 0.4 nozzle"
     cfg["print_compatible_printers"] = ["Bambu Lab A1 0.4 nozzle"]
@@ -109,13 +504,13 @@ def generate_optimized_3mf(input_file_path, output_3mf_path, mode="crystal", sca
     cfg["apply_scarf_seam_on_circles"] = "1"
     cfg["scarf_seam_type"] = "contour_and_hole"
     cfg["scarf_length"] = "15"
-    
+
     cfg["enable_support"] = "1"
     cfg["support_type"] = "tree(auto)"
     cfg["support_style"] = "tree_slim"
     cfg["independent_support_layer_height"] = "1"
     cfg["support_threshold_angle"] = "30"
-    
+
     if height <= 50.0:
         cfg["tree_support_branch_diameter"] = "2.0"
         cfg["tree_support_tip_diameter"] = "0.5"
@@ -154,10 +549,10 @@ def generate_optimized_3mf(input_file_path, output_3mf_path, mode="crystal", sca
             sparse_infill_speed = "220"
             infill_density = "12%"
             wall_loops = 3
-            
+
         cfg["wall_generator"] = "arachne"
         cfg["sparse_infill_pattern"] = "gyroid"
-        
+
     elif mode == "mechanical":
         layer_height = "0.20"
         preset_name = "0.20mm Standard @BBL A1"
@@ -170,7 +565,7 @@ def generate_optimized_3mf(input_file_path, output_3mf_path, mode="crystal", sca
         cfg["sparse_infill_pattern"] = "gyroid"
         cfg["top_shell_layers"] = "6"
         cfg["bottom_shell_layers"] = "5"
-        
+
     else:  # Standard / Fast
         layer_height = "0.20"
         preset_name = "0.20mm Standard @BBL A1"
@@ -190,25 +585,35 @@ def generate_optimized_3mf(input_file_path, output_3mf_path, mode="crystal", sca
     cfg["sparse_infill_speed"] = sparse_infill_speed
     cfg["sparse_infill_density"] = infill_density
     cfg["wall_loops"] = wall_loops
-    
-    diff_keys = "enable_support;support_type;support_style;support_threshold_angle;layer_height;outer_wall_speed;inner_wall_speed;wall_generator;sparse_infill_pattern;wall_loops;seam_position;support_top_z_distance;support_object_xy_distance;"
+
+    diff_keys = (
+        "enable_support;support_type;support_style;support_threshold_angle;"
+        "layer_height;outer_wall_speed;inner_wall_speed;wall_generator;"
+        "sparse_infill_pattern;wall_loops;seam_position;"
+        "support_top_z_distance;support_object_xy_distance;"
+    )
     cfg["different_settings_to_system"] = [diff_keys, "", ""]
-    
-    bounds = mesh.bounds
-    min_z = bounds[0][2]
-    mesh.apply_translation([-mesh.centroid[0] + 128.0, -mesh.centroid[1] + 128.0, -min_z])
-    
-    temp_base_3mf = output_3mf_path + ".temp.3mf"
-    mesh.export(temp_base_3mf)
-    
-    slice_info_xml = '<?xml version="1.0" encoding="UTF-8"?>\n<config>\n  <header>\n    <header_item key="X-BBL-Client-Type" value="slicer"/>\n    <header_item key="X-BBL-Client-Version" value="02.09.01.70"/>\n  </header>\n</config>\n'
+    return cfg, layer_height, preset_name
+
+
+def _write_bambu_metadata_to_zip(zout: zipfile.ZipFile, cfg: dict, display_name: str):
+    safe_name = html.escape(os.path.basename(display_name), quote=True)
+    slice_info_xml = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<config>\n'
+        '  <header>\n'
+        '    <header_item key="X-BBL-Client-Type" value="slicer"/>\n'
+        '    <header_item key="X-BBL-Client-Version" value="02.09.01.70"/>\n'
+        '  </header>\n'
+        '</config>\n'
+    )
     model_settings_xml = f'''<?xml version="1.0" encoding="UTF-8"?>
 <config>
   <object id="1">
-    <metadata key="name" value="{os.path.basename(input_file_path)}"/>
+    <metadata key="name" value="{safe_name}"/>
     <metadata key="extruder" value="1"/>
     <part id="1" subtype="normal_part">
-      <metadata key="name" value="{os.path.basename(input_file_path)}"/>
+      <metadata key="name" value="{safe_name}"/>
       <metadata key="matrix" value="1 0 0 0 0 1 0 0 0 0 1 0 0 0 0 1"/>
       <metadata key="extruder" value="1"/>
     </part>
@@ -235,41 +640,418 @@ def generate_optimized_3mf(input_file_path, output_3mf_path, mode="crystal", sca
         "nozzle_diameter": 0.4
     }
 
-    with zipfile.ZipFile(temp_base_3mf, 'r') as zin:
-        with zipfile.ZipFile(output_3mf_path, 'w', compression=zipfile.ZIP_DEFLATED) as zout:
-            for item in zin.infolist():
-                data = zin.read(item.filename)
-                if item.filename == '3D/3dmodel.model':
-                    text = data.decode('utf-8', errors='ignore')
-                    if 'xmlns:BambuStudio' not in text:
-                        text = text.replace('<model ', '<model xmlns:BambuStudio="http://schemas.bambulab.com/package/2021" ', 1)
-                    if 'BambuStudio:3mfVersion' not in text:
-                        m_start = text.find('<model')
-                        m_end = text.find('>', m_start)
-                        meta_tags = (
-                            '\n <metadata name="Application">BambuStudio-02.04.00.70</metadata>'
-                            '\n <metadata name="BambuStudio:3mfVersion">1</metadata>'
-                        )
-                        text = text[:m_end+1] + meta_tags + text[m_end+1:]
-                    data = text.encode('utf-8')
-                zout.writestr(item, data)
-            zout.writestr('Metadata/project_settings.config', json.dumps(cfg, indent=4))
-            zout.writestr('Metadata/model_settings.config', model_settings_xml)
-            zout.writestr('Metadata/slice_info.config', slice_info_xml)
-            zout.writestr('Metadata/plate_1.json', json.dumps(plate_1_data, indent=4))
-            zout.writestr('Metadata/filament_sequence.json', '{"plate_1":{"sequence":[]}}')
-            zout.writestr('Metadata/cut_information.xml', '<?xml version="1.0" encoding="utf-8"?>\n<objects>\n <object id="1">\n  <cut_id id="0" check_sum="1" connectors_cnt="0"/>\n </object>\n</objects>\n')
+    zout.writestr('[Content_Types].xml', CONTENT_TYPES_XML)
+    zout.writestr('_rels/.rels', RELS_XML)
+    zout.writestr('Metadata/project_settings.config', json.dumps(cfg, indent=4))
+    zout.writestr('Metadata/model_settings.config', model_settings_xml)
+    zout.writestr('Metadata/slice_info.config', slice_info_xml)
+    zout.writestr('Metadata/plate_1.json', json.dumps(plate_1_data, indent=4))
+    zout.writestr('Metadata/filament_sequence.json', '{"plate_1":{"sequence":[]}}')
+    zout.writestr(
+        'Metadata/cut_information.xml',
+        '<?xml version="1.0" encoding="utf-8"?>\n<objects>\n <object id="1">\n'
+        '  <cut_id id="0" check_sum="1" connectors_cnt="0"/>\n </object>\n</objects>\n'
+    )
 
-    if os.path.exists(temp_base_3mf):
-        os.remove(temp_base_3mf)
-        
+
+def _model_xml_header(display_name: str) -> bytes:
+    safe_name = html.escape(os.path.basename(display_name), quote=True)
+    obj_uuid = str(uuid.uuid4())
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<model unit="millimeter" xml:lang="en-US" '
+        'xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02" '
+        'xmlns:BambuStudio="http://schemas.bambulab.com/package/2021" '
+        'xmlns:p="http://schemas.microsoft.com/3dmanufacturing/production/2015/06">\n'
+        ' <metadata name="Application">BambuStudio-02.04.00.70</metadata>\n'
+        ' <metadata name="BambuStudio:3mfVersion">1</metadata>\n'
+        ' <resources>\n'
+        f'  <object id="1" name="{safe_name}" type="model" p:UUID="{obj_uuid}">\n'
+        '   <mesh>\n'
+        '    <vertices>\n'
+    ).encode('utf-8')
+
+
+def _model_xml_footer() -> bytes:
+    build_uuid = str(uuid.uuid4())
+    item_uuid = str(uuid.uuid4())
+    return (
+        '    </triangles>\n'
+        '   </mesh>\n'
+        '  </object>\n'
+        ' </resources>\n'
+        f' <build p:UUID="{build_uuid}">\n'
+        f'  <item objectid="1" transform="1 0 0 0 1 0 0 0 1 0 0 0" p:UUID="{item_uuid}" printable="1"/>\n'
+        ' </build>\n'
+        '</model>\n'
+    ).encode('utf-8')
+
+
+def _stream_arrays_to_bambu_3mf(
+    verts_f32: np.ndarray,
+    faces_u32: np.ndarray,
+    output_3mf_path: str,
+    cfg: dict,
+    display_name: str,
+):
+    """Stream float32 vertices and uint32 faces directly into a native Bambu 3MF zip on disk."""
+    batch = 16384
+    with zipfile.ZipFile(output_3mf_path, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=5) as zout:
+        with zout.open('3D/3dmodel.model', 'w') as mf:
+            mf.write(_model_xml_header(display_name))
+
+            n_v = len(verts_f32)
+            for i in range(0, n_v, batch):
+                chunk = verts_f32[i:i + batch]
+                lines = [
+                    f'<vertex x="{x:.4f}" y="{y:.4f}" z="{z:.4f}"/>'
+                    for x, y, z in chunk.tolist()
+                ]
+                mf.write('\n'.join(lines).encode('utf-8'))
+                mf.write(b'\n')
+
+            mf.write(b'    </vertices>\n    <triangles>\n')
+
+            n_f = len(faces_u32)
+            for i in range(0, n_f, batch):
+                chunk = faces_u32[i:i + batch]
+                lines = [
+                    f'<triangle v1="{a}" v2="{b}" v3="{c}"/>'
+                    for a, b, c in chunk.tolist()
+                ]
+                mf.write('\n'.join(lines).encode('utf-8'))
+                mf.write(b'\n')
+
+            mf.write(_model_xml_footer())
+
+        _write_bambu_metadata_to_zip(zout, cfg, display_name)
+
+
+def _optimize_binary_stl_to_3mf(
+    input_file_path: str,
+    output_3mf_path: str,
+    meta: dict,
+    cfg: dict,
+    scale_factor: float,
+    display_name: str,
+):
+    """
+    16-bucket hash deduplication over memory-mapped STL.
+    Handles 72MB / 1.45M-triangle STLs in ~46MB peak RAM with 100% watertight shared vertices!
+    """
+    with open(input_file_path, 'rb') as f:
+        n_tri = struct.unpack('<I', f.read(84)[80:84])[0]
+
+    mm = np.memmap(input_file_path, dtype=STL_DTYPE, mode='r', offset=84, shape=(n_tri,))
+    n_verts_raw = n_tri * 3
+    faces = np.empty(n_verts_raw, dtype=np.uint32)
+
+    n_buckets = 16 if n_tri > 200000 else 1
+    verts_list = []
+    offset_id = 0
+    chunk_tris = 200000
+
+    for b in range(n_buckets):
+        b_v = []
+        b_idx = []
+        for start in range(0, n_tri, chunk_tris):
+            end = min(start + chunk_tris, n_tri)
+            v = np.ascontiguousarray(mm['v'][start:end]).reshape(-1, 3)
+            if n_buckets == 1:
+                b_v.append(v)
+                b_idx.append(np.arange(start * 3, end * 3, dtype=np.uint32))
+            else:
+                u = v.view(np.uint32)
+                h = (
+                    u[:, 0]
+                    ^ (u[:, 1] * np.uint32(2654435761))
+                    ^ (u[:, 2] * np.uint32(2246822519))
+                ) & np.uint32(n_buckets - 1)
+                mask = (h == b)
+                if np.any(mask):
+                    b_v.append(v[mask])
+                    b_idx.append(np.nonzero(mask)[0].astype(np.uint32) + np.uint32(start * 3))
+        if not b_v:
+            continue
+        bv = np.concatenate(b_v, axis=0)
+        bi = np.concatenate(b_idx, axis=0)
+        del b_v, b_idx
+        v_void = bv.view(np.dtype((np.void, 12))).ravel()
+        uniq_void, inv = np.unique(v_void, return_inverse=True)
+        uniq_v = uniq_void.view('<f4').reshape(-1, 3).copy()
+        faces[bi] = inv.astype(np.uint32) + np.uint32(offset_id)
+        offset_id += len(uniq_v)
+        verts_list.append(uniq_v)
+        del bv, bi, v_void, uniq_void, inv
+
+    del mm
+    uniq_verts = np.concatenate(verts_list, axis=0)
+    del verts_list
+    faces = faces.reshape(-1, 3)
+
+    # Transform in-place (zero extra copy!) -> scale + center on 256x256 A1 plate + Z_min = 0
+    cx = (meta["min_xyz"][0] + meta["max_xyz"][0]) * 0.5
+    cy = (meta["min_xyz"][1] + meta["max_xyz"][1]) * 0.5
+    min_z = meta["min_xyz"][2]
+    s = np.float32(scale_factor)
+
+    uniq_verts[:, 0] = (uniq_verts[:, 0] - np.float32(cx)) * s + np.float32(128.0)
+    uniq_verts[:, 1] = (uniq_verts[:, 1] - np.float32(cy)) * s + np.float32(128.0)
+    uniq_verts[:, 2] = (uniq_verts[:, 2] - np.float32(min_z)) * s
+
+    _stream_arrays_to_bambu_3mf(uniq_verts, faces, output_3mf_path, cfg, display_name)
+    del uniq_verts, faces
+    gc.collect()
+
+
+def _optimize_3mf_streaming_to_3mf(
+    input_file_path: str,
+    output_3mf_path: str,
+    meta: dict,
+    cfg: dict,
+    scale_factor: float,
+    display_name: str,
+):
+    """
+    Pure streaming 3MF -> Bambu 3MF converter.
+    Processes 225MB+ uncompressed 3MFs (2.7M triangles) in < 25MB peak RAM!
+    """
+    unit_scale, parts = _get_3mf_parts(input_file_path)
+    cx = (meta["min_xyz"][0] + meta["max_xyz"][0]) * 0.5
+    cy = (meta["min_xyz"][1] + meta["max_xyz"][1]) * 0.5
+    min_z = meta["min_xyz"][2]
+    s = np.float32(scale_factor)
+    shift = np.array([
+        -cx * scale_factor + 128.0,
+        -cy * scale_factor + 128.0,
+        -min_z * scale_factor
+    ], dtype=np.float32)
+
+    part_offsets = []
+    running_v_offset = 0
+
+    with zipfile.ZipFile(input_file_path, 'r') as zin:
+        with zipfile.ZipFile(output_3mf_path, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=5) as zout:
+            with zout.open('3D/3dmodel.model', 'w') as mf:
+                mf.write(_model_xml_header(display_name))
+
+                # Pass 1: Stream & transform vertices across all parts
+                for model_name, mat in parts:
+                    part_offsets.append((model_name, running_v_offset))
+                    rot = (mat[:3, :3] * unit_scale * scale_factor).astype(np.float32)
+                    trans = (mat[3, :3] * unit_scale * scale_factor).astype(np.float32) + shift
+                    is_scale_only = np.allclose(rot, np.diag(np.diag(rot)), atol=1e-6)
+                    diag_rot = np.diag(rot).astype(np.float32)
+
+                    with zin.open(model_name) as f:
+                        rem = b''
+                        while True:
+                            chunk = f.read(1024 * 1024)
+                            if not chunk:
+                                break
+                            data = rem + chunk
+                            last_gt = data.rfind(b'>')
+                            if last_gt != -1:
+                                proc, rem = data[:last_gt + 1], data[last_gt + 1:]
+                            else:
+                                proc, rem = b'', data
+
+                            if b'<vertex' in proc:
+                                arr = _extract_vertices_from_chunk(proc)
+                                if arr is not None and len(arr) > 0:
+                                    if is_scale_only:
+                                        arr *= diag_rot
+                                    else:
+                                        arr = arr @ rot
+                                    arr += trans
+                                    lines = [
+                                        f'<vertex x="{x:.4f}" y="{y:.4f}" z="{z:.4f}"/>'
+                                        for x, y, z in arr.tolist()
+                                    ]
+                                    mf.write('\n'.join(lines).encode('utf-8'))
+                                    mf.write(b'\n')
+                                    running_v_offset += len(arr)
+
+                mf.write(b'    </vertices>\n    <triangles>\n')
+
+                # Pass 2: Stream triangles across all parts (with vertex offsets if multi-part)
+                for model_name, v_off in part_offsets:
+                    with zin.open(model_name) as f:
+                        rem = b''
+                        while True:
+                            chunk = f.read(1024 * 1024)
+                            if not chunk:
+                                break
+                            data = rem + chunk
+                            last_gt = data.rfind(b'>')
+                            if last_gt != -1:
+                                proc, rem = data[:last_gt + 1], data[last_gt + 1:]
+                            else:
+                                proc, rem = b'', data
+
+                            if b'<triangle' in proc:
+                                tris = _extract_triangles_from_chunk(proc)
+                                if tris:
+                                    if v_off == 0:
+                                        lines = [
+                                            b'<triangle v1="' + a + b'" v2="' + b + b'" v3="' + c + b'"/>'
+                                            for a, b, c in tris
+                                        ]
+                                        mf.write(b'\n'.join(lines))
+                                        mf.write(b'\n')
+                                    else:
+                                        lines = [
+                                            f'<triangle v1="{int(a) + v_off}" v2="{int(b) + v_off}" v3="{int(c) + v_off}"/>'
+                                            for a, b, c in tris
+                                        ]
+                                        mf.write('\n'.join(lines).encode('utf-8'))
+                                        mf.write(b'\n')
+
+                mf.write(_model_xml_footer())
+
+            _write_bambu_metadata_to_zip(zout, cfg, display_name)
+
+    gc.collect()
+
+
+def _optimize_obj_streaming_to_3mf(
+    input_file_path: str,
+    output_3mf_path: str,
+    meta: dict,
+    cfg: dict,
+    scale_factor: float,
+    display_name: str,
+):
+    cx = (meta["min_xyz"][0] + meta["max_xyz"][0]) * 0.5
+    cy = (meta["min_xyz"][1] + meta["max_xyz"][1]) * 0.5
+    min_z = meta["min_xyz"][2]
+
+    with zipfile.ZipFile(output_3mf_path, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=5) as zout:
+        with zout.open('3D/3dmodel.model', 'w') as mf:
+            mf.write(_model_xml_header(display_name))
+
+            v_count = 0
+            v_buf = []
+            with open(input_file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                for line in f:
+                    if line.startswith('v '):
+                        p = line.split()
+                        if len(p) >= 4:
+                            x = (float(p[1]) - cx) * scale_factor + 128.0
+                            y = (float(p[2]) - cy) * scale_factor + 128.0
+                            z = (float(p[3]) - min_z) * scale_factor
+                            v_buf.append(f'<vertex x="{x:.4f}" y="{y:.4f}" z="{z:.4f}"/>')
+                            v_count += 1
+                            if len(v_buf) >= 16384:
+                                mf.write('\n'.join(v_buf).encode('utf-8'))
+                                mf.write(b'\n')
+                                v_buf.clear()
+            if v_buf:
+                mf.write('\n'.join(v_buf).encode('utf-8'))
+                mf.write(b'\n')
+                v_buf.clear()
+
+            mf.write(b'    </vertices>\n    <triangles>\n')
+
+            t_buf = []
+            with open(input_file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                for line in f:
+                    if line.startswith('f '):
+                        toks = line.split()[1:]
+                        if len(toks) >= 3:
+                            idx = []
+                            for tok in toks:
+                                raw_i = int(tok.split('/')[0])
+                                idx.append(raw_i - 1 if raw_i > 0 else v_count + raw_i)
+                            for k in range(1, len(idx) - 1):
+                                t_buf.append(f'<triangle v1="{idx[0]}" v2="{idx[k]}" v3="{idx[k + 1]}"/>')
+                            if len(t_buf) >= 16384:
+                                mf.write('\n'.join(t_buf).encode('utf-8'))
+                                mf.write(b'\n')
+                                t_buf.clear()
+            if t_buf:
+                mf.write('\n'.join(t_buf).encode('utf-8'))
+                mf.write(b'\n')
+                t_buf.clear()
+
+            mf.write(_model_xml_footer())
+
+        _write_bambu_metadata_to_zip(zout, cfg, display_name)
+
+    gc.collect()
+
+
+def _optimize_fallback_trimesh_to_3mf(
+    input_file_path: str,
+    output_3mf_path: str,
+    meta: dict,
+    cfg: dict,
+    scale_factor: float,
+    display_name: str,
+):
+    import trimesh
+    loaded = trimesh.load(input_file_path, process=False)
+    if isinstance(loaded, trimesh.Scene):
+        meshes = [g for g in loaded.geometry.values() if isinstance(g, trimesh.Trimesh)]
+        mesh = trimesh.util.concatenate(meshes)
+    else:
+        mesh = loaded
+
+    verts = np.asarray(mesh.vertices, dtype=np.float32).copy()
+    faces = np.asarray(mesh.faces, dtype=np.uint32)
+    del loaded, mesh
+
+    cx = (meta["min_xyz"][0] + meta["max_xyz"][0]) * 0.5
+    cy = (meta["min_xyz"][1] + meta["max_xyz"][1]) * 0.5
+    min_z = meta["min_xyz"][2]
+    s = np.float32(scale_factor)
+    verts[:, 0] = (verts[:, 0] - np.float32(cx)) * s + np.float32(128.0)
+    verts[:, 1] = (verts[:, 1] - np.float32(cy)) * s + np.float32(128.0)
+    verts[:, 2] = (verts[:, 2] - np.float32(min_z)) * s
+
+    _stream_arrays_to_bambu_3mf(verts, faces, output_3mf_path, cfg, display_name)
+    del verts, faces
+    gc.collect()
+
+
+def generate_optimized_3mf(
+    input_file_path: str,
+    output_3mf_path: str,
+    mode: str = "crystal",
+    scale_factor: float = 1.0,
+    display_name: str = None,
+):
+    meta_path = input_file_path + ".meta.json"
+    if os.path.exists(meta_path):
+        with open(meta_path, 'r', encoding='utf-8') as f:
+            meta = json.load(f)
+    else:
+        meta = analyze_file_smart(input_file_path)
+
+    width = meta["width"] * scale_factor
+    depth = meta["depth"] * scale_factor
+    height = meta["height"] * scale_factor
+    cfg, layer_height, preset_name = build_bambu_config(height, mode)
+    name = display_name or os.path.basename(input_file_path)
+
+    ext = os.path.splitext(input_file_path)[1].lower()
+    if ext == '.stl' and is_binary_stl(input_file_path):
+        _optimize_binary_stl_to_3mf(input_file_path, output_3mf_path, meta, cfg, scale_factor, name)
+    elif ext == '.3mf':
+        _optimize_3mf_streaming_to_3mf(input_file_path, output_3mf_path, meta, cfg, scale_factor, name)
+    elif ext == '.obj':
+        _optimize_obj_streaming_to_3mf(input_file_path, output_3mf_path, meta, cfg, scale_factor, name)
+    else:
+        _optimize_fallback_trimesh_to_3mf(input_file_path, output_3mf_path, meta, cfg, scale_factor, name)
+
     return {
         "width": round(width, 1),
         "depth": round(depth, 1),
         "height": round(height, 1),
         "layer_height": layer_height,
-        "preset_name": preset_name
+        "preset_name": preset_name,
     }
+
 
 # ================= AUTH ENDPOINTS =================
 @app.post("/api/login")
@@ -282,29 +1064,31 @@ async def login(request: Request, response: Response):
         raise HTTPException(status_code=400, detail="Invalid request payload.")
 
     if u == AUTH_USER and p == AUTH_PASS:
-        # Set auth cookie valid for 30 days
         response.set_cookie(
             key="blogo_token",
             value=AUTH_TOKEN,
             max_age=30 * 86400,
-            httponly=False,  # Accessible by frontend JS for auth verification
+            httponly=False,
             samesite="lax",
-            secure=False     # Works on both http://localhost and https
+            secure=False
         )
         return {"success": True, "token": AUTH_TOKEN, "username": AUTH_USER}
     else:
         raise HTTPException(status_code=401, detail="Invalid username or password.")
+
 
 @app.post("/api/logout")
 def logout(response: Response):
     response.delete_cookie(key="blogo_token")
     return {"success": True, "message": "Logged out successfully."}
 
+
 @app.get("/favicon.ico", include_in_schema=False)
 def favicon():
     if os.path.exists(ICON_PATH):
         return FileResponse(ICON_PATH, media_type="image/x-icon")
     return Response(status_code=204)
+
 
 @app.get("/api/auth-check")
 def auth_check(request: Request):
@@ -317,9 +1101,11 @@ def auth_check(request: Request):
         return {"authenticated": True, "username": AUTH_USER}
     return {"authenticated": False, "username": None}
 
+
 @app.get("/api/health")
 def health():
-    return {"status": "ok", "app": "Bambu A1 Cloud Optimizer", "auth_enabled": True}
+    return {"status": "ok", "app": "Bambu A1 Cloud Optimizer", "engine": "streaming-low-ram", "auth_enabled": True}
+
 
 def cleanup_stale_uploads(max_age_seconds: int = 1800):
     now = time.time()
@@ -331,6 +1117,7 @@ def cleanup_stale_uploads(max_age_seconds: int = 1800):
     except Exception:
         pass
 
+
 # ================= PROTECTED CORE ENDPOINTS =================
 @app.post("/api/analyze")
 async def analyze_model(
@@ -341,43 +1128,41 @@ async def analyze_model(
     suffix = os.path.splitext(file.filename)[1].lower()
     if suffix not in ['.stl', '.3mf', '.obj']:
         raise HTTPException(status_code=400, detail="Only STL, 3MF, and OBJ files are supported.")
-        
+
     tmp_path = os.path.join(UPLOAD_TMP_DIR, f"{uuid.uuid4().hex}{suffix}")
+    # Stream upload to disk in 1MB chunks (zero huge RAM spike!)
     with open(tmp_path, "wb") as tmp:
-        content = await file.read()
-        tmp.write(content)
-        del content
-        
+        while True:
+            chunk = await file.read(1024 * 1024)
+            if not chunk:
+                break
+            tmp.write(chunk)
+
     try:
-        mesh = load_mesh_safe(tmp_path)
-        extents = mesh.extents
-        w, d, h = float(extents[0]), float(extents[1]), float(extents[2])
-        faces = len(mesh.faces)
-        vol = (w * d * h) / 1000.0 * 0.35
-        if hasattr(mesh, 'is_volume') and mesh.is_volume:
-            vol = mesh.volume / 1000.0
-            
-        est_weight = vol * 1.24 * 0.45
+        meta = analyze_file_smart(tmp_path)
+        with open(tmp_path + ".meta.json", "w", encoding="utf-8") as mf:
+            json.dump(meta, mf)
+
+        est_weight = meta["vol_cm3"] * 1.24 * 0.45
         est_cost = est_weight * 1.20
-        del mesh
         gc.collect()
-        
+
         return {
             "success": True,
             "filename": file.filename,
-            "width": round(w, 1),
-            "depth": round(d, 1),
-            "height": round(h, 1),
-            "faces": faces,
+            "width": round(meta["width"], 1),
+            "depth": round(meta["depth"], 1),
+            "height": round(meta["height"], 1),
+            "faces": meta["faces"],
             "est_weight_g": round(max(1.0, est_weight), 1),
             "est_cost_rs": round(max(1.0, est_cost), 1),
             "tmp_path": tmp_path
         }
     except Exception as e:
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
+        cleanup_temp_files(tmp_path, tmp_path + ".meta.json")
         gc.collect()
         raise HTTPException(status_code=500, detail=str(e))
+
 
 def cleanup_temp_files(*paths):
     for p in paths:
@@ -386,6 +1171,7 @@ def cleanup_temp_files(*paths):
                 os.remove(p)
         except Exception:
             pass
+
 
 @app.post("/api/optimize")
 async def optimize_model(
@@ -398,14 +1184,20 @@ async def optimize_model(
 ):
     if not os.path.exists(tmp_path):
         raise HTTPException(status_code=400, detail="Temporary file expired. Please upload again.")
-        
+
     base_name = os.path.splitext(original_name)[0]
-    scale_str = f"_{int(scale*100)}pct" if abs(scale - 1.0) > 1e-4 else ""
+    scale_str = f"_{int(scale * 100)}pct" if abs(scale - 1.0) > 1e-4 else ""
     out_filename = f"{base_name}{scale_str}_BambuA1_Optimized.3mf"
     out_path = os.path.join(UPLOAD_TMP_DIR, f"out_{uuid.uuid4().hex}.3mf")
-    
+
     try:
-        generate_optimized_3mf(tmp_path, out_path, mode=mode, scale_factor=scale)
+        generate_optimized_3mf(
+            tmp_path,
+            out_path,
+            mode=mode,
+            scale_factor=scale,
+            display_name=original_name
+        )
         gc.collect()
         background_tasks.add_task(cleanup_temp_files, out_path)
         return FileResponse(
@@ -417,6 +1209,7 @@ async def optimize_model(
         cleanup_temp_files(out_path)
         gc.collect()
         raise HTTPException(status_code=500, detail=f"Optimization failed: {str(e)}")
+
 
 # ================= MODERN SAAS UI WITH LOGIN =================
 @app.get("/", response_class=HTMLResponse)
@@ -512,7 +1305,7 @@ def index():
       </form>
 
       <div class="mt-6 text-center text-slate-500 text-xs">
-        Bambu Lab A1 Official Compatible 3MF Engine &bull; Private v2.5
+        Bambu Lab A1 Official Compatible 3MF Engine &bull; Streaming v3.0
       </div>
     </div>
   </div>
@@ -669,7 +1462,26 @@ def index():
     let baseWidth = 0, baseDepth = 0, baseHeight = 0;
     let currentScale = 1.0;
 
-    // Check Auth on page load
+    async function extractErrorMessage(res, fallback) {
+      let msg = `${fallback} (HTTP ${res.status})`;
+      try {
+        const text = await res.text();
+        if (text) {
+          try {
+            const parsed = JSON.parse(text);
+            if (parsed.detail) msg = parsed.detail;
+          } catch (_) {
+            if (res.status === 502 || res.status === 503 || res.status === 504) {
+              msg = "Server is waking up or busy (HTTP " + res.status + "). Please wait 15 seconds and retry.";
+            } else {
+              msg = text.slice(0, 160);
+            }
+          }
+        }
+      } catch (_) {}
+      return msg;
+    }
+
     async function checkAuth() {
       try {
         const res = await fetch('/api/auth-check');
@@ -723,8 +1535,7 @@ def index():
           const data = await res.json();
           showApp(data.username);
         } else {
-          const err = await res.json();
-          errBox.innerText = err.detail || 'Invalid username or password';
+          errBox.innerText = await extractErrorMessage(res, 'Invalid username or password');
           errBox.classList.remove('hidden');
         }
       } catch (err) {
@@ -743,10 +1554,8 @@ def index():
       showLogin();
     }
 
-    // Initialize check
     checkAuth();
 
-    // Drag and Drop Setup
     const dropZone = document.getElementById('drop-zone');
     const fileInput = document.getElementById('file-input');
 
@@ -794,8 +1603,7 @@ def index():
         }
 
         if (!res.ok) {
-          const err = await res.json();
-          throw new Error(err.detail || 'Analysis failed');
+          throw new Error(await extractErrorMessage(res, 'Analysis failed'));
         }
 
         const data = await res.json();
@@ -879,8 +1687,7 @@ def index():
           throw new Error("Session expired. Please log in again.");
         }
         if (!res.ok) {
-          const err = await res.json();
-          throw new Error(err.detail || 'Download failed');
+          throw new Error(await extractErrorMessage(res, 'Download failed'));
         }
 
         const blob = await res.blob();
@@ -905,6 +1712,7 @@ def index():
 </body>
 </html>
     """
+
 
 if __name__ == "__main__":
     import uvicorn

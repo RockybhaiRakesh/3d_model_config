@@ -271,20 +271,27 @@ def _get_3mf_parts(zip_path: str):
             except Exception:
                 pass
 
-        # Case B: Large inline 3dmodel.model -> check tail for <item transform="...">
+        # Case B: Large inline 3dmodel.model -> stream to read <build> tail without loading full XML
+        ext_models = [n for n in names if n.lower().endswith('.model') and n != root_name]
+        if ext_models:
+            return unit_scale, [(m, np.eye(4, dtype=np.float64)) for m in ext_models]
+
         tail_mat = np.eye(4, dtype=np.float64)
         try:
+            tail_bytes = b""
             with z.open(root_name) as f:
-                # Read only small tail if possible via streaming chunks keeping last 16KB
-                if root_info.file_size <= 64 * 1024:
-                    tail = f.read().decode('utf-8', errors='ignore')
-                else:
-                    # Quick scan for external object models first
-                    ext_models = [n for n in names if n.lower().endswith('.model') and n != root_name]
-                    if ext_models:
-                        return unit_scale, [(m, np.eye(4, dtype=np.float64)) for m in ext_models]
-                    return unit_scale, [(root_name, tail_mat)]
-            m_item = re.search(r'<item[^>]*transform=["\']([^"\']+)["\']', tail)
+                while True:
+                    chunk = f.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    if len(chunk) >= 32768:
+                        tail_bytes = chunk[-32768:]
+                    else:
+                        tail_bytes = (tail_bytes + chunk)[-32768:]
+            tail_str = tail_bytes.decode('utf-8', errors='ignore')
+            build_idx = tail_str.rfind('<build')
+            search_area = tail_str[build_idx:] if build_idx != -1 else tail_str
+            m_item = re.search(r'<item[^>]*\btransform=["\']([^"\']+)["\']', search_area)
             if m_item:
                 tail_mat = _parse_3mf_matrix(m_item.group(1))
         except Exception:
@@ -827,17 +834,19 @@ def _optimize_3mf_streaming_to_3mf(
         -min_z * scale_factor
     ], dtype=np.float32)
 
-    part_offsets = []
+    part_mesh_offsets = []
     running_v_offset = 0
+    re_verts_open = re.compile(rb'(<vertices\b[^>]*>)')
+    re_tris_open = re.compile(rb'(<triangles\b[^>]*>)')
 
     with zipfile.ZipFile(input_file_path, 'r') as zin:
         with zipfile.ZipFile(output_3mf_path, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=5) as zout:
             with zout.open('3D/3dmodel.model', 'w') as mf:
                 mf.write(_model_xml_header(display_name))
 
-                # Pass 1: Stream & transform vertices across all parts
+                # Pass 1: Stream & transform vertices across all parts (tracking per-<mesh> offsets)
                 for model_name, mat in parts:
-                    part_offsets.append((model_name, running_v_offset))
+                    mesh_offsets = []
                     rot = (mat[:3, :3] * unit_scale * scale_factor).astype(np.float32)
                     trans = (mat[3, :3] * unit_scale * scale_factor).astype(np.float32) + shift
                     is_scale_only = np.allclose(rot, np.diag(np.diag(rot)), atol=1e-6)
@@ -856,26 +865,42 @@ def _optimize_3mf_streaming_to_3mf(
                             else:
                                 proc, rem = b'', data
 
-                            if b'<vertex' in proc:
-                                arr = _extract_vertices_from_chunk(proc)
-                                if arr is not None and len(arr) > 0:
-                                    if is_scale_only:
-                                        arr *= diag_rot
-                                    else:
-                                        arr = arr @ rot
-                                    arr += trans
-                                    lines = [
-                                        f'<vertex x="{x:.4f}" y="{y:.4f}" z="{z:.4f}"/>'
-                                        for x, y, z in arr.tolist()
-                                    ]
-                                    mf.write('\n'.join(lines).encode('utf-8'))
-                                    mf.write(b'\n')
-                                    running_v_offset += len(arr)
+                            if b'<vertices' in proc:
+                                segments = re_verts_open.split(proc)
+                            else:
+                                segments = [proc]
+
+                            for seg in segments:
+                                if not seg:
+                                    continue
+                                if seg.startswith(b'<vertices'):
+                                    mesh_offsets.append(running_v_offset)
+                                elif b'<vertex' in seg:
+                                    arr = _extract_vertices_from_chunk(seg)
+                                    if arr is not None and len(arr) > 0:
+                                        if is_scale_only:
+                                            arr *= diag_rot
+                                        else:
+                                            arr = arr @ rot
+                                        arr += trans
+                                        lines = [
+                                            f'<vertex x="{x:.4f}" y="{y:.4f}" z="{z:.4f}"/>'
+                                            for x, y, z in arr.tolist()
+                                        ]
+                                        mf.write('\n'.join(lines).encode('utf-8'))
+                                        mf.write(b'\n')
+                                        running_v_offset += len(arr)
+
+                    if not mesh_offsets:
+                        mesh_offsets = [0]
+                    part_mesh_offsets.append((model_name, mesh_offsets))
 
                 mf.write(b'    </vertices>\n    <triangles>\n')
 
-                # Pass 2: Stream triangles across all parts (with vertex offsets if multi-part)
-                for model_name, v_off in part_offsets:
+                # Pass 2: Stream triangles across all parts using exact per-<mesh> vertex offsets
+                for model_name, mesh_offsets in part_mesh_offsets:
+                    m_idx = -1
+                    cur_off = mesh_offsets[0]
                     with zin.open(model_name) as f:
                         rem = b''
                         while True:
@@ -889,23 +914,35 @@ def _optimize_3mf_streaming_to_3mf(
                             else:
                                 proc, rem = b'', data
 
-                            if b'<triangle' in proc:
-                                tris = _extract_triangles_from_chunk(proc)
-                                if tris:
-                                    if v_off == 0:
-                                        lines = [
-                                            b'<triangle v1="' + a + b'" v2="' + b + b'" v3="' + c + b'"/>'
-                                            for a, b, c in tris
-                                        ]
-                                        mf.write(b'\n'.join(lines))
-                                        mf.write(b'\n')
-                                    else:
-                                        lines = [
-                                            f'<triangle v1="{int(a) + v_off}" v2="{int(b) + v_off}" v3="{int(c) + v_off}"/>'
-                                            for a, b, c in tris
-                                        ]
-                                        mf.write('\n'.join(lines).encode('utf-8'))
-                                        mf.write(b'\n')
+                            if b'<triangles' in proc:
+                                segments = re_tris_open.split(proc)
+                            else:
+                                segments = [proc]
+
+                            for seg in segments:
+                                if not seg:
+                                    continue
+                                if seg.startswith(b'<triangles'):
+                                    m_idx += 1
+                                    if m_idx < len(mesh_offsets):
+                                        cur_off = mesh_offsets[m_idx]
+                                elif b'<triangle ' in seg:
+                                    tris = _extract_triangles_from_chunk(seg)
+                                    if tris:
+                                        if cur_off == 0:
+                                            lines = [
+                                                b'<triangle v1="' + a + b'" v2="' + b + b'" v3="' + c + b'"/>'
+                                                for a, b, c in tris
+                                            ]
+                                            mf.write(b'\n'.join(lines))
+                                            mf.write(b'\n')
+                                        else:
+                                            lines = [
+                                                f'<triangle v1="{int(a) + cur_off}" v2="{int(b) + cur_off}" v3="{int(c) + cur_off}"/>'
+                                                for a, b, c in tris
+                                            ]
+                                            mf.write('\n'.join(lines).encode('utf-8'))
+                                            mf.write(b'\n')
 
                 mf.write(_model_xml_footer())
 

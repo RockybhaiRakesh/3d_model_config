@@ -1,0 +1,10 @@
+__pycache__
+build
+dist
+*.stl
+*.3mf
+*.obj
+*.gcode
+karupu
+*.exe
+*.spec

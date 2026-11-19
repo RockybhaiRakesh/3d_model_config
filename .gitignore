@@ -1,0 +1,41 @@
+# Python caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+
+# Environment files
+.env
+.env.local
+
+# PyInstaller / Packaging
+build/
+dist/
+*.spec
+*.exe
+
+# Debug / Archive scratch files
+archive/
+
+# OS / Editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Large 3D Models & Sliced Gcodes (Crucial: Keep repository lightweight)
+*.stl
+*.3mf
+*.obj
+*.step
+*.stp
+*.gcode
+karupu/
+
+# Temp files
+*.tmp
+*.temp.3mf

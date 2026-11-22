@@ -477,12 +477,36 @@ def analyze_file_smart(file_path: str) -> dict:
         raise ValueError("Only STL, 3MF, and OBJ files are supported.")
 
 
-def build_bambu_config(height: float, mode: str):
-    """Build exact calibrated Bambu Lab A1 project_settings.config."""
+def _sanitize_hex_color(color: str, default_color: str = "#000000") -> str:
+    if isinstance(color, str) and re.fullmatch(r"#[0-9a-fA-F]{6}", color.strip()):
+        return color.strip().upper()
+    return default_color
+
+
+def build_bambu_config(
+    height: float,
+    mode: str,
+    filament: str = "pla_basic",
+    nozzle_temp: int = None,
+    bed_temp: int = None,
+    filament_color: str = None,
+):
+    """Build exact calibrated Bambu Lab A1 project_settings.config (PLA Basic & PLA Silk+)."""
     cfg = get_base_bambu_template()
     for k, v in list(cfg.items()):
         if isinstance(v, list) and len(v) == 4:
             cfg[k] = [v[0]]
+
+    is_silk = (filament == "pla_silk")
+    default_nozzle = 215 if is_silk else 220
+    default_bed = 60 if is_silk else 65
+    default_color = "#D4AF37" if is_silk else "#000000"
+
+    nt = int(nozzle_temp) if nozzle_temp is not None else default_nozzle
+    nt = max(185, min(260, nt))
+    bt = int(bed_temp) if bed_temp is not None else default_bed
+    bt = max(35, min(90, bt))
+    color_hex = _sanitize_hex_color(filament_color, default_color)
 
     cfg["flush_volumes_matrix"] = ["0"]
     cfg["flush_volumes_vector"] = ["0", "0"]
@@ -490,22 +514,37 @@ def build_bambu_config(height: float, mode: str):
     cfg["printer_model"] = "Bambu Lab A1"
     cfg["printer_settings_id"] = "Bambu Lab A1 0.4 nozzle"
     cfg["print_compatible_printers"] = ["Bambu Lab A1 0.4 nozzle"]
-    cfg["default_filament_profile"] = ["Bambu PLA Basic @BBL A1"]
-    cfg["filament_settings_id"] = ["Bambu PLA Basic @BBL A1"]
+    cfg["filament_diameter"] = ["1.75"]
     cfg["filament_type"] = ["PLA"]
-    cfg["filament_vendor"] = ["Bambu Lab"]
-    cfg["filament_colour"] = ["#000000"]
-    cfg["default_filament_colour"] = ["#000000"]
-    cfg["filament_ids"] = ["GFA00"]
+    cfg["filament_colour"] = [color_hex]
+    cfg["default_filament_colour"] = [color_hex]
     cfg["filament_self_index"] = ["1"]
     cfg["filament_map"] = ["1"]
     cfg["filament_volume_map"] = ["0"]
     cfg["filament_is_support"] = ["0"]
     cfg["curr_bed_type"] = "Textured PEI Plate"
-    cfg["textured_plate_temp"] = ["65"]
-    cfg["textured_plate_temp_initial_layer"] = ["65"]
-    cfg["nozzle_temperature"] = ["220"]
-    cfg["nozzle_temperature_initial_layer"] = ["220"]
+    cfg["textured_plate_temp"] = [str(bt)]
+    cfg["textured_plate_temp_initial_layer"] = [str(bt)]
+    cfg["nozzle_temperature"] = [str(nt)]
+    cfg["nozzle_temperature_initial_layer"] = [str(nt)]
+
+    if is_silk:
+        cfg["default_filament_profile"] = ["Generic PLA Silk @BBL A1"]
+        cfg["filament_settings_id"] = ["Generic PLA Silk @BBL A1"]
+        cfg["filament_vendor"] = ["Generic"]
+        cfg["filament_ids"] = ["GFL96"]
+        cfg["nozzle_temperature_range_low"] = ["200"]
+        cfg["nozzle_temperature_range_high"] = ["220"]
+        cfg["filament_max_volumetric_speed"] = ["8"]
+    else:
+        cfg["default_filament_profile"] = ["Bambu PLA Basic @BBL A1"]
+        cfg["filament_settings_id"] = ["Bambu PLA Basic @BBL A1"]
+        cfg["filament_vendor"] = ["Bambu Lab"]
+        cfg["filament_ids"] = ["GFA00"]
+        cfg["nozzle_temperature_range_low"] = ["190"]
+        cfg["nozzle_temperature_range_high"] = ["240"]
+        cfg["filament_max_volumetric_speed"] = ["21"]
+
     cfg["initial_layer_print_height"] = "0.2"
     cfg["seam_position"] = "back"
     cfg["apply_scarf_seam_on_circles"] = "1"
@@ -521,9 +560,10 @@ def build_bambu_config(height: float, mode: str):
     if height <= 50.0:
         cfg["tree_support_branch_diameter"] = "2.0"
         cfg["tree_support_tip_diameter"] = "0.5"
-        cfg["support_top_z_distance"] = "0.16"
-        cfg["support_bottom_z_distance"] = "0.16"
-        cfg["support_object_xy_distance"] = "0.30"
+        z_gap = "0.18" if is_silk else "0.16"
+        cfg["support_top_z_distance"] = z_gap
+        cfg["support_bottom_z_distance"] = z_gap
+        cfg["support_object_xy_distance"] = "0.35" if is_silk else "0.30"
     else:
         cfg["tree_support_branch_diameter"] = "3.0"
         cfg["tree_support_tip_diameter"] = "0.8"
@@ -535,25 +575,25 @@ def build_bambu_config(height: float, mode: str):
         if height <= 50.0:
             layer_height = "0.08"
             preset_name = "0.08mm Extra Fine @BBL A1"
-            outer_wall_speed = "35"
-            inner_wall_speed = "80"
-            sparse_infill_speed = "120"
+            outer_wall_speed = 35
+            inner_wall_speed = 80
+            sparse_infill_speed = 120
             infill_density = "15%"
             wall_loops = 4
         elif height <= 130.0:
             layer_height = "0.12"
             preset_name = "0.12mm High Quality @BBL A1"
-            outer_wall_speed = "45"
-            inner_wall_speed = "120"
-            sparse_infill_speed = "180"
+            outer_wall_speed = 40 if is_silk else 45
+            inner_wall_speed = 120
+            sparse_infill_speed = 180
             infill_density = "15%"
             wall_loops = 3
         else:
             layer_height = "0.16"
             preset_name = "0.16mm Optimal @BBL A1"
-            outer_wall_speed = "65"
-            inner_wall_speed = "150"
-            sparse_infill_speed = "220"
+            outer_wall_speed = 45 if is_silk else 65
+            inner_wall_speed = 120 if is_silk else 150
+            sparse_infill_speed = 180 if is_silk else 220
             infill_density = "12%"
             wall_loops = 3
 
@@ -563,9 +603,9 @@ def build_bambu_config(height: float, mode: str):
     elif mode == "mechanical":
         layer_height = "0.20"
         preset_name = "0.20mm Standard @BBL A1"
-        outer_wall_speed = "120"
-        inner_wall_speed = "180"
-        sparse_infill_speed = "220"
+        outer_wall_speed = 120
+        inner_wall_speed = 180
+        sparse_infill_speed = 220
         infill_density = "25%"
         wall_loops = 4
         cfg["wall_generator"] = "classic"
@@ -576,35 +616,55 @@ def build_bambu_config(height: float, mode: str):
     else:  # Standard / Fast
         layer_height = "0.20"
         preset_name = "0.20mm Standard @BBL A1"
-        outer_wall_speed = "150"
-        inner_wall_speed = "220"
-        sparse_infill_speed = "270"
+        outer_wall_speed = 150
+        inner_wall_speed = 220
+        sparse_infill_speed = 270
         infill_density = "15%"
         wall_loops = 2
         cfg["wall_generator"] = "arachne"
         cfg["sparse_infill_pattern"] = "cross_hatch"
 
+    # PLA Silk+ Mirror-Gloss & Layer-Strength Calibration across all modes
+    if is_silk:
+        outer_wall_speed = min(outer_wall_speed, 45)
+        inner_wall_speed = min(inner_wall_speed, 120)
+        sparse_infill_speed = min(sparse_infill_speed, 180)
+        wall_loops = max(wall_loops, 3)
+        cfg["outer_wall_acceleration"] = ["2000"]
+        cfg["top_surface_speed"] = ["100"]
+    else:
+        cfg["outer_wall_acceleration"] = ["5000"]
+        cfg["top_surface_speed"] = ["200"]
+
     cfg["print_settings_id"] = preset_name
     cfg["default_print_profile"] = preset_name
     cfg["layer_height"] = layer_height
-    cfg["outer_wall_speed"] = outer_wall_speed
-    cfg["inner_wall_speed"] = inner_wall_speed
-    cfg["sparse_infill_speed"] = sparse_infill_speed
+    cfg["outer_wall_speed"] = [str(outer_wall_speed)]
+    cfg["inner_wall_speed"] = [str(inner_wall_speed)]
+    cfg["sparse_infill_speed"] = [str(sparse_infill_speed)]
     cfg["sparse_infill_density"] = infill_density
-    cfg["wall_loops"] = wall_loops
+    cfg["wall_loops"] = str(wall_loops)
 
-    diff_keys = (
+    process_diff = (
         "enable_support;support_type;support_style;support_threshold_angle;"
-        "layer_height;outer_wall_speed;inner_wall_speed;wall_generator;"
-        "sparse_infill_pattern;wall_loops;seam_position;"
-        "support_top_z_distance;support_object_xy_distance;"
+        "layer_height;outer_wall_speed;inner_wall_speed;outer_wall_acceleration;"
+        "top_surface_speed;wall_generator;sparse_infill_pattern;wall_loops;"
+        "seam_position;support_top_z_distance;support_object_xy_distance;"
     )
-    cfg["different_settings_to_system"] = [diff_keys, "", ""]
+    filament_diff = (
+        "nozzle_temperature;nozzle_temperature_initial_layer;"
+        "textured_plate_temp;textured_plate_temp_initial_layer;"
+        "filament_max_volumetric_speed"
+    )
+    cfg["different_settings_to_system"] = [process_diff, filament_diff, ""]
     return cfg, layer_height, preset_name
 
 
 def _write_bambu_metadata_to_zip(zout: zipfile.ZipFile, cfg: dict, display_name: str):
     safe_name = html.escape(os.path.basename(display_name), quote=True)
+    active_color = "#000000"
+    if isinstance(cfg.get("filament_colour"), list) and cfg["filament_colour"]:
+        active_color = cfg["filament_colour"][0]
     slice_info_xml = (
         '<?xml version="1.0" encoding="UTF-8"?>\n'
         '<config>\n'
@@ -641,7 +701,7 @@ def _write_bambu_metadata_to_zip(zout: zipfile.ZipFile, cfg: dict, display_name:
 
     plate_1_data = {
         "bed_type": "textured_plate",
-        "filament_colors": ["#000000"],
+        "filament_colors": [active_color],
         "filament_ids": [0],
         "first_extruder": 0,
         "nozzle_diameter": 0.4
@@ -1057,6 +1117,10 @@ def generate_optimized_3mf(
     mode: str = "crystal",
     scale_factor: float = 1.0,
     display_name: str = None,
+    filament: str = "pla_basic",
+    nozzle_temp: int = None,
+    bed_temp: int = None,
+    filament_color: str = None,
 ):
     meta_path = input_file_path + ".meta.json"
     if os.path.exists(meta_path):
@@ -1068,7 +1132,14 @@ def generate_optimized_3mf(
     width = meta["width"] * scale_factor
     depth = meta["depth"] * scale_factor
     height = meta["height"] * scale_factor
-    cfg, layer_height, preset_name = build_bambu_config(height, mode)
+    cfg, layer_height, preset_name = build_bambu_config(
+        height,
+        mode,
+        filament=filament,
+        nozzle_temp=nozzle_temp,
+        bed_temp=bed_temp,
+        filament_color=filament_color,
+    )
     name = display_name or os.path.basename(input_file_path)
 
     ext = os.path.splitext(input_file_path)[1].lower()
@@ -1217,6 +1288,10 @@ async def optimize_model(
     original_name: str = Form(...),
     mode: str = Form("crystal"),
     scale: float = Form(1.0),
+    filament: str = Form("pla_basic"),
+    nozzle_temp: int = Form(None),
+    bed_temp: int = Form(None),
+    filament_color: str = Form(None),
     user: str = Depends(get_current_user)
 ):
     if not os.path.exists(tmp_path):
@@ -1224,7 +1299,8 @@ async def optimize_model(
 
     base_name = os.path.splitext(original_name)[0]
     scale_str = f"_{int(scale * 100)}pct" if abs(scale - 1.0) > 1e-4 else ""
-    out_filename = f"{base_name}{scale_str}_BambuA1_Optimized.3mf"
+    fil_tag = "_PLASilk" if filament == "pla_silk" else ""
+    out_filename = f"{base_name}{scale_str}{fil_tag}_BambuA1_Optimized.3mf"
     out_path = os.path.join(UPLOAD_TMP_DIR, f"out_{uuid.uuid4().hex}.3mf")
 
     try:
@@ -1233,7 +1309,11 @@ async def optimize_model(
             out_path,
             mode=mode,
             scale_factor=scale,
-            display_name=original_name
+            display_name=original_name,
+            filament=filament,
+            nozzle_temp=nozzle_temp,
+            bed_temp=bed_temp,
+            filament_color=filament_color,
         )
         gc.collect()
         background_tasks.add_task(cleanup_temp_files, out_path)
@@ -1342,7 +1422,7 @@ def index():
       </form>
 
       <div class="mt-6 text-center text-slate-500 text-xs">
-        Bambu Lab A1 Official Compatible 3MF Engine &bull; Streaming v3.0
+        Bambu Lab A1 Official Compatible 3MF Engine &bull; Streaming v3.1 (PLA Silk+ Ready)
       </div>
     </div>
   </div>
@@ -1415,21 +1495,21 @@ def index():
         <label class="block text-sm font-bold text-slate-800 mb-2">1. Select Print Precision Mode</label>
         <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
           
-          <label class="relative flex flex-col p-4 border-2 border-teal-500 bg-teal-50/40 rounded-2xl cursor-pointer hover:bg-teal-50/70 transition">
+          <label id="mode-card-crystal" onclick="selectModeCard('crystal')" class="relative flex flex-col p-4 border-2 border-teal-500 bg-teal-50/40 rounded-2xl cursor-pointer hover:bg-teal-50/70 transition">
             <input type="radio" name="mode" value="crystal" checked class="absolute top-4 right-4 text-teal-600 focus:ring-teal-500">
             <span class="text-sm font-black text-slate-800">👑 Crystal Devotional</span>
             <span class="text-xs text-teal-700 font-semibold mt-0.5">Ultra Sharp Face & Hand Details</span>
             <span class="text-[11px] text-slate-500 mt-2">Adaptive 0.08mm - 0.12mm layers, 35mm/s outer wall, Arachne engine.</span>
           </label>
 
-          <label class="relative flex flex-col p-4 border-2 border-slate-200 bg-white rounded-2xl cursor-pointer hover:bg-slate-50 transition">
+          <label id="mode-card-mechanical" onclick="selectModeCard('mechanical')" class="relative flex flex-col p-4 border-2 border-slate-200 bg-white rounded-2xl cursor-pointer hover:bg-slate-50 transition">
             <input type="radio" name="mode" value="mechanical" class="absolute top-4 right-4 text-teal-600 focus:ring-teal-500">
             <span class="text-sm font-black text-slate-800">⚙️ Mechanical / Strong</span>
             <span class="text-xs text-indigo-700 font-semibold mt-0.5">High Strength & Fast</span>
             <span class="text-[11px] text-slate-500 mt-2">0.20mm layers, 4 walls, 25% gyroid infill, 6 top/bottom shells.</span>
           </label>
 
-          <label class="relative flex flex-col p-4 border-2 border-slate-200 bg-white rounded-2xl cursor-pointer hover:bg-slate-50 transition">
+          <label id="mode-card-standard" onclick="selectModeCard('standard')" class="relative flex flex-col p-4 border-2 border-slate-200 bg-white rounded-2xl cursor-pointer hover:bg-slate-50 transition">
             <input type="radio" name="mode" value="standard" class="absolute top-4 right-4 text-teal-600 focus:ring-teal-500">
             <span class="text-sm font-black text-slate-800">⚡ Standard Speed</span>
             <span class="text-xs text-amber-700 font-semibold mt-0.5">Everyday Prototyping</span>
@@ -1439,10 +1519,65 @@ def index():
         </div>
       </div>
 
+      <!-- Filament Material Selection -->
+      <div>
+        <div class="flex flex-wrap items-center justify-between gap-2 mb-2">
+          <label class="text-sm font-bold text-slate-800">2. Select Filament Material (1.75mm)</label>
+          <span id="filament-live-badge" class="text-[11px] font-bold text-slate-700 bg-slate-100 border border-slate-200 px-2.5 py-0.5 rounded-full">
+            PLA Basic &bull; 220°C Nozzle &bull; 65°C Bed &bull; 21 mm³/s Flow
+          </span>
+        </div>
+
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-3 mb-3">
+          <label id="fil-card-pla_basic" onclick="selectFilament('pla_basic')" class="relative flex flex-col p-4 border-2 border-teal-500 bg-teal-50/40 rounded-2xl cursor-pointer hover:bg-teal-50/70 transition">
+            <input type="radio" name="filament" value="pla_basic" checked class="absolute top-4 right-4 text-teal-600 focus:ring-teal-500">
+            <span class="text-sm font-black text-slate-800">⬛ PLA Basic / Matte</span>
+            <span class="text-xs text-teal-700 font-semibold mt-0.5">Bambu PLA Basic @BBL A1 &bull; 1.75mm</span>
+            <span class="text-[11px] text-slate-500 mt-1.5">220°C nozzle, 65°C PEI bed, 21 mm³/s flow, standard high-speed cooling.</span>
+          </label>
+
+          <label id="fil-card-pla_silk" onclick="selectFilament('pla_silk')" class="relative flex flex-col p-4 border-2 border-slate-200 bg-white rounded-2xl cursor-pointer hover:bg-amber-50/50 transition">
+            <input type="radio" name="filament" value="pla_silk" class="absolute top-4 right-4 text-amber-500 focus:ring-amber-500">
+            <span class="text-sm font-black text-slate-800">✨ PLA Silk / Silk+ (Gold / Metallic)</span>
+            <span class="text-xs text-amber-700 font-semibold mt-0.5">Mirror-Gloss Finish &bull; 1.75mm &bull; 200–220°C</span>
+            <span class="text-[11px] text-slate-500 mt-1.5">215°C gloss sweet-spot, 60°C bed, 40mm/s shiny outer wall, 2000 accel, 8 mm³/s flow.</span>
+          </label>
+        </div>
+
+        <!-- Spool Temp & Color Fine-Tune Bar -->
+        <div class="bg-slate-50 border border-slate-200 rounded-2xl p-3.5 flex flex-wrap items-center gap-4">
+          <div class="flex items-center space-x-2">
+            <label for="nozzle-temp-input" class="text-xs font-bold text-slate-600">🌡️ Nozzle (°C):</label>
+            <input type="number" id="nozzle-temp-input" value="220" min="185" max="260" oninput="updateFilamentBadge()"
+              class="w-20 px-2.5 py-1.5 bg-white border border-slate-300 rounded-lg text-xs font-extrabold text-slate-800 focus:outline-none focus:border-teal-500">
+          </div>
+
+          <div class="flex items-center space-x-2">
+            <label for="bed-temp-input" class="text-xs font-bold text-slate-600">🔥 Bed (°C):</label>
+            <input type="number" id="bed-temp-input" value="65" min="35" max="90" oninput="updateFilamentBadge()"
+              class="w-20 px-2.5 py-1.5 bg-white border border-slate-300 rounded-lg text-xs font-extrabold text-slate-800 focus:outline-none focus:border-teal-500">
+          </div>
+
+          <div class="flex items-center space-x-2">
+            <span class="text-xs font-bold text-slate-600">🎨 Color:</span>
+            <div class="flex items-center space-x-1.5">
+              <button type="button" onclick="setFilamentColor('#D4AF37')" title="Silk Gold" class="w-6 h-6 rounded-full border-2 border-slate-300 shadow-sm hover:scale-110 transition" style="background: linear-gradient(135deg, #F6E27A, #D4AF37, #AA7C11);"></button>
+              <button type="button" onclick="setFilamentColor('#FFD700')" title="Yellow Silk Gold" class="w-6 h-6 rounded-full border-2 border-slate-300 shadow-sm hover:scale-110 transition" style="background: #FFD700;"></button>
+              <button type="button" onclick="setFilamentColor('#000000')" title="Black" class="w-6 h-6 rounded-full border-2 border-slate-300 shadow-sm hover:scale-110 transition" style="background: #111111;"></button>
+              <button type="button" onclick="setFilamentColor('#FFFFFF')" title="White" class="w-6 h-6 rounded-full border-2 border-slate-300 shadow-sm hover:scale-110 transition" style="background: #FFFFFF;"></button>
+              <button type="button" onclick="setFilamentColor('#B87333')" title="Copper Silk" class="w-6 h-6 rounded-full border-2 border-slate-300 shadow-sm hover:scale-110 transition" style="background: #B87333;"></button>
+              <button type="button" onclick="setFilamentColor('#C0C0C0')" title="Silver Silk" class="w-6 h-6 rounded-full border-2 border-slate-300 shadow-sm hover:scale-110 transition" style="background: #C0C0C0;"></button>
+              <input type="color" id="filament-color-input" value="#000000" oninput="updateFilamentBadge()" title="Custom Color"
+                class="w-7 h-7 rounded-lg border border-slate-300 cursor-pointer bg-white p-0.5">
+            </div>
+          </div>
+        </div>
+      </div>
+
       <!-- Quick Scaling Tools -->
       <div>
         <div class="flex items-center justify-between mb-2">
-          <label class="text-sm font-bold text-slate-800">2. Adjust Idol Height & Scale</label>
+          <label class="text-sm font-bold text-slate-800">3. Adjust Idol Height & Scale</label>
           <span class="text-xs font-bold text-teal-700 bg-teal-100 px-2.5 py-0.5 rounded-full" id="active-scale-badge">100% Scale</span>
         </div>
         
@@ -1705,17 +1840,91 @@ def index():
       document.getElementById('cost-display').innerText = `📊 Est Material: ~${weight}g | Est PLA Cost: ~₹${cost}`;
     }
 
+    function selectModeCard(selected) {
+      const radio = document.querySelector(`input[name="mode"][value="${selected}"]`);
+      if (radio) radio.checked = true;
+      ['crystal', 'mechanical', 'standard'].forEach((m) => {
+        const card = document.getElementById('mode-card-' + m);
+        if (!card) return;
+        if (m === selected) {
+          card.classList.remove('border-slate-200', 'bg-white');
+          card.classList.add('border-teal-500', 'bg-teal-50/40');
+        } else {
+          card.classList.remove('border-teal-500', 'bg-teal-50/40');
+          card.classList.add('border-slate-200', 'bg-white');
+        }
+      });
+    }
+
+    function selectFilament(fil) {
+      const radio = document.querySelector(`input[name="filament"][value="${fil}"]`);
+      if (radio) radio.checked = true;
+      const basicCard = document.getElementById('fil-card-pla_basic');
+      const silkCard = document.getElementById('fil-card-pla_silk');
+      const nozzleInput = document.getElementById('nozzle-temp-input');
+      const bedInput = document.getElementById('bed-temp-input');
+      const colorInput = document.getElementById('filament-color-input');
+
+      if (fil === 'pla_silk') {
+        silkCard.classList.remove('border-slate-200', 'bg-white');
+        silkCard.classList.add('border-amber-500', 'bg-amber-50/60');
+        basicCard.classList.remove('border-teal-500', 'bg-teal-50/40');
+        basicCard.classList.add('border-slate-200', 'bg-white');
+        nozzleInput.value = 215;
+        bedInput.value = 60;
+        colorInput.value = '#D4AF37';
+      } else {
+        basicCard.classList.remove('border-slate-200', 'bg-white');
+        basicCard.classList.add('border-teal-500', 'bg-teal-50/40');
+        silkCard.classList.remove('border-amber-500', 'bg-amber-50/60');
+        silkCard.classList.add('border-slate-200', 'bg-white');
+        nozzleInput.value = 220;
+        bedInput.value = 65;
+        colorInput.value = '#000000';
+      }
+      updateFilamentBadge(fil);
+    }
+
+    function setFilamentColor(hex) {
+      document.getElementById('filament-color-input').value = hex;
+      updateFilamentBadge();
+    }
+
+    function updateFilamentBadge(explicitFil) {
+      const filEl = document.querySelector('input[name="filament"]:checked');
+      const fil = explicitFil || (filEl ? filEl.value : 'pla_basic');
+      const nt = document.getElementById('nozzle-temp-input').value || (fil === 'pla_silk' ? 215 : 220);
+      const bt = document.getElementById('bed-temp-input').value || (fil === 'pla_silk' ? 60 : 65);
+      const badge = document.getElementById('filament-live-badge');
+      if (fil === 'pla_silk') {
+        badge.className = "text-[11px] font-bold text-amber-800 bg-amber-100 border border-amber-300 px-2.5 py-0.5 rounded-full";
+        badge.innerHTML = `✨ PLA Silk+ (1.75mm) &bull; ${nt}°C Nozzle &bull; ${bt}°C Bed &bull; 40mm/s Gloss &bull; 8 mm³/s Flow`;
+      } else {
+        badge.className = "text-[11px] font-bold text-slate-700 bg-slate-100 border border-slate-200 px-2.5 py-0.5 rounded-full";
+        badge.innerHTML = `PLA Basic (1.75mm) &bull; ${nt}°C Nozzle &bull; ${bt}°C Bed &bull; 21 mm³/s Flow`;
+      }
+    }
+
     async function downloadOptimized3MF() {
       const btn = document.getElementById('download-btn');
       btn.disabled = true;
       btn.innerText = "⏳ Packaging Bambu A1 3MF...";
 
       const mode = document.querySelector('input[name="mode"]:checked').value;
+      const filament = document.querySelector('input[name="filament"]:checked').value;
+      const nozzleTemp = document.getElementById('nozzle-temp-input').value;
+      const bedTemp = document.getElementById('bed-temp-input').value;
+      const filamentColor = document.getElementById('filament-color-input').value;
+
       const formData = new FormData();
       formData.append('tmp_path', currentTmpPath);
       formData.append('original_name', originalFilename);
       formData.append('mode', mode);
       formData.append('scale', currentScale);
+      formData.append('filament', filament);
+      formData.append('nozzle_temp', nozzleTemp);
+      formData.append('bed_temp', bedTemp);
+      formData.append('filament_color', filamentColor);
 
       try {
         const res = await fetch('/api/optimize', { method: 'POST', body: formData });
@@ -1732,8 +1941,9 @@ def index():
         const a = document.createElement('a');
         a.href = url;
         const scaleStr = Math.abs(currentScale - 1.0) > 1e-4 ? `_${Math.round(currentScale*100)}pct` : '';
+        const filTag = filament === 'pla_silk' ? '_PLASilk' : '';
         const base = originalFilename.substring(0, originalFilename.lastIndexOf('.')) || originalFilename;
-        a.download = `${base}${scaleStr}_BambuA1_Optimized.3mf`;
+        a.download = `${base}${scaleStr}${filTag}_BambuA1_Optimized.3mf`;
         document.body.appendChild(a);
         a.click();
         a.remove();
